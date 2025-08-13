@@ -3,6 +3,7 @@ title: SMART - Sequential Multi-Agent Reasoning Technique (OpenRouter edition)
 author: MartianInGreen (modified by MichaelSParkin3)
 author_url: https://github.com/MichaelSParkin3/Open-WebUI-SMART-Tools-OpenRouter
 description: SMART is a sequential multi-agent reasoning technique. Uses OpenRouter + online/Wolfram tools.
+git_url: https://github.com/you/my-super-tool
 required_open_webui_version: 0.5.0
 requirements: langchain-openai, langgraph==0.2.60, requests, pydantic>=2
 version: 1.2-or
