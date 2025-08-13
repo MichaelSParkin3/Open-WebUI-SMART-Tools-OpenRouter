@@ -2,11 +2,11 @@
 title: SMART - Sequential Multi-Agent Reasoning Technique (OpenRouter edition)
 author: MartianInGreen (modified by MichaelSParkin3)
 author_url: https://github.com/MichaelSParkin3/Open-WebUI-SMART-Tools-OpenRouter
-description: SMART is a sequential multi-agent reasoning technique. Uses OpenRouter + online/Wolfram tools.
+description: SMART is a sequential multi-agent reasoning technique. Uses OpenRouter + online/Wolfram/YouTube tools.
 git_url: https://github.com/you/my-super-tool
 required_open_webui_version: 0.5.0
-requirements: langchain-openai, langgraph==0.2.60, requests, pydantic>=2
-version: 1.2
+requirements: langchain-openai, langgraph==0.2.60, requests, pydantic>=2, youtube_transcript_api, google-api-python-client
+version: 1.3.1
 licence: MIT
 """
 
@@ -24,6 +24,8 @@ from typing import (
     Optional,
     Protocol,
     get_type_hints,
+    List,
+    Dict,
 )
 
 import requests
@@ -34,6 +36,14 @@ from langchain_openai import ChatOpenAI
 from langchain_core.tools import StructuredTool
 from langgraph.prebuilt import create_react_agent
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
+
+from youtube_transcript_api import (
+    YouTubeTranscriptApi,
+    NoTranscriptFound,
+    TranscriptsDisabled,
+)
+from googleapiclient.discovery import build
+from functools import lru_cache
 
 # ---------------------------------------------------------------
 
@@ -65,10 +75,11 @@ You should respond by following these steps:
         - If you think reasoning is needed, include #reasoning. If not #no-reasoning.
         - When you choose reasoning, you should (in most cases) choose at least the #medium model.
     3. Third, you can make tools avalible to the final agent. You can enable multiple tools.
-        - Avalible tools are #online, #wolfram
+        - Avalible tools are #online, #wolfram, #youtube
         - Use #online to enable multiple tools such as Search and a Scraping tool. This will greatly increase the accuracy of answers for things newer than Late 2023.
         - Use #wolfram to enable access to Wolfram|Alpha, a powerful computational knowledge engine and scientific and real-time database.
             - Wolfram|Alpha is very good at math (integrals, roots, limits...), real-time data (weather, stocks, FX), and structured facts.
+        - Use #youtube to get video transcripts or search for videos.
         - If the prompt involves math, enable #wolfram.
     
 Example response:
@@ -155,6 +166,50 @@ PROMPT_WolframAlpha = """<wolframInstructions>
 Wolfram|Alpha is an advanced computational knowledge engine and database with accurate scientific and real-time data. 
 Keep queries concise (e.g., "integral of x^2", "weather Buenos Aires today"). Prefer simple inputs; do heavy plotting in Python (not available here).
 </wolframInstructions>"""
+
+PROMPT_YouTube = """<youtubeInstructions>
+You have access to YouTube tools. You can search for videos and get their transcripts.
+When presenting results, always include the video title and a link to the video.
+For transcripts, mention the language of the transcript.
+</youtubeInstructions>"""
+
+
+# ---------------------------------------------------------------
+# YOUTUBE Pydantic Models
+# --------------------------------------------------------------
+class TranscriptDownloadResult(BaseModel):
+    video_id: str = Field(..., description="YouTube video ID")
+    title: str = Field(..., description="Video title")
+    channel: str = Field(..., description="Channel or author name")
+    description: str = Field(..., description="Full video description")
+    duration: str = Field(..., description="ISO8601 duration (e.g. 'PT5M33S')")
+    view_count: str = Field(..., description="Total view count as string")
+    transcription: List[str] = Field(
+        ..., description="List of transcript text segments"
+    )
+    transcript_language: str = Field(
+        "", description="Language code of the transcript (e.g., 'en', 'es')"
+    )
+    transcript_error: str = Field(
+        "", description="Error message if transcript fetch failed"
+    )
+
+
+class SearchItem(BaseModel):
+    video_id: str = Field(..., description="Unique YouTube video ID")
+    title: str = Field(..., description="Video title")
+    channel: str = Field(..., description="Channel or uploader name")
+    published_at: str = Field(..., description="ISO8601 publication timestamp")
+    description: str = Field(..., description="Snippet description")
+    view_count: str = Field(..., description="Total view count as string")
+    like_count: str = Field(..., description="Total like count as string")
+    comment_count: str = Field(..., description="Total comment count as string")
+    length: str = Field(..., description="ISO8601 duration of the video")
+
+
+class SearchResult(BaseModel):
+    results: List[SearchItem] = Field(..., description="List of search results")
+
 
 # ---------------------------------------------------------------
 # TOOLS
@@ -493,6 +548,9 @@ class Pipe:
             WOLFRAMALPHA_APP_ID: str = Field(
                 default="", description="WolframAlpha App ID"
             )
+            YOUTUBE_API_KEY: str = Field(
+                default="", description="YouTube Data API v3 key"
+            )
             AGENT_NAME: str = Field(
                 default="Smart/Core (OpenRouter)", description="Name of the agent"
             )
@@ -600,6 +658,135 @@ class Pipe:
             return data
         except Exception:
             return "Error fetching Wolfram|Alpha results."
+
+    # ---------- YouTube Tools ----------
+    def _get_supported_languages(self) -> List[str]:
+        return ["en", "es"]
+
+    def _extract_transcript_text(self, transcript_data) -> List[str]:
+        # The youtube_transcript_api can return transcript segments as either dictionaries
+        # or objects (FetchedTranscriptSnippet). The original code only handled dictionaries,
+        # causing an error. This updated function handles both cases.
+        texts = []
+        for segment in transcript_data:
+            if isinstance(segment, dict):
+                texts.append(segment.get("text", ""))
+            else:
+                texts.append(getattr(segment, 'text', ''))
+        return texts
+
+    def _fetch_transcript(self, video_id: str) -> tuple[List[str], str, str]:
+        transcription, lang_code, err_msg = [], "", ""
+        try:
+            transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+            for transcript in transcript_list:
+                if transcript.language_code in self._get_supported_languages():
+                    transcript_data = transcript.fetch()
+                    transcription = self._extract_transcript_text(transcript_data)
+                    lang_code = transcript.language_code
+                    return transcription, lang_code, ""
+        except (NoTranscriptFound, TranscriptsDisabled) as e:
+            err_msg = str(e)
+        except Exception as e:
+            err_msg = f"An unexpected error occurred: {e}"
+        return transcription, lang_code, err_msg
+
+    async def get_youtube_transcript(self, video_id: str) -> str:
+        """
+        Download metadata and full transcript for a given YouTube video.
+        :param video_id: The ID of the YouTube video.
+        """
+        transcription, language_code, error_message = self._fetch_transcript(video_id)
+
+        youtube = build("youtube", "v3", developerKey=self.valves.YOUTUBE_API_KEY)
+        try:
+            resp = (
+                youtube.videos()
+                .list(part="snippet,contentDetails,statistics", id=video_id)
+                .execute()
+            )
+            item = resp.get("items", [{}])[0]
+            sn, cd, st = (
+                item.get("snippet", {}),
+                item.get("contentDetails", {}),
+                item.get("statistics", {}),
+            )
+
+            result = TranscriptDownloadResult(
+                video_id=video_id,
+                title=sn.get("title", ""),
+                channel=sn.get("channelTitle", ""),
+                description=sn.get("description", ""),
+                duration=cd.get("duration", ""),
+                view_count=st.get("viewCount", "0"),
+                transcription=transcription,
+                transcript_language=language_code,
+                transcript_error=error_message,
+            )
+            return result.model_dump_json()
+        except Exception as e:
+            return json.dumps({"error": f"Failed to fetch video details: {e}"})
+
+    @lru_cache(maxsize=128)
+    def _search_youtube_logic(self, query: str, max_results: int) -> List[Dict]:
+        if not 1 <= max_results <= 50:
+            raise ValueError("max_results must be between 1 and 50")
+
+        youtube = build("youtube", "v3", developerKey=self.valves.YOUTUBE_API_KEY)
+        search_resp = (
+            Youtube()
+            .list(part="snippet", q=query, type="video", maxResults=max_results)
+            .execute()
+        )
+
+        results, video_ids = [], []
+        for item in search_resp.get("items", []):
+            vid = item["id"]["videoId"]
+            snip = item["snippet"]
+            video_ids.append(vid)
+            results.append(
+                {
+                    "video_id": vid,
+                    "title": snip.get("title", ""),
+                    "channel": snip.get("channelTitle", ""),
+                    "published_at": snip.get("publishedAt", ""),
+                    "description": snip.get("description", ""),
+                }
+            )
+
+        if video_ids:
+            detail_resp = (
+                youtube.videos()
+                .list(part="statistics,contentDetails", id=",".join(video_ids))
+                .execute()
+            )
+            detail_map = {item["id"]: item for item in detail_resp.get("items", [])}
+            for entry in results:
+                det = detail_map.get(entry["video_id"], {})
+                stats, cd = det.get("statistics", {}), det.get("contentDetails", {})
+                entry.update(
+                    {
+                        "view_count": stats.get("viewCount", "0"),
+                        "like_count": stats.get("likeCount", "0"),
+                        "comment_count": stats.get("commentCount", "0"),
+                        "length": cd.get("duration", ""),
+                    }
+                )
+        return results
+
+    async def Youtube(self, query: str, max_results: int = 5) -> str:
+        """
+        Search YouTube for videos.
+        :param query: The search query.
+        :param max_results: The maximum number of results to return (1-50).
+        """
+        try:
+            entries = self._search_youtube_logic(query, max_results)
+            items = [SearchItem(**e) for e in entries]
+            result = SearchResult(results=items)
+            return result.model_dump_json()
+        except Exception as e:
+            return json.dumps({"error": str(e)})
 
     async def dummy_tool(self):
         """No-op tool used when no tools are enabled."""
@@ -793,6 +980,18 @@ class Pipe:
                     )
                 ):
                     tool_list.append("wolfram_alpha")
+                if (
+                    "#youtube" in csv_hastag_list
+                    or (
+                        isinstance(last_msg_content, str)
+                        and "#youtube" in last_msg_content
+                    )
+                    or (
+                        isinstance(last_msg_content, list)
+                        and "#youtube" in last_msg_content[0].get("text", "")
+                    )
+                ):
+                    tool_list.append("youtube")
 
             await send_citation(
                 url=f"SMART Planning",
@@ -885,6 +1084,27 @@ class Pipe:
                                     description=desc,
                                 )
                             )
+                    if tool == "youtube":
+                        youtube_funcs = [
+                            (self.Youtube, "Search YouTube for videos."),
+                            (
+                                self.get_youtube_transcript,
+                                "Get the transcript of a YouTube video.",
+                            ),
+                        ]
+                        for func, desc in youtube_funcs:
+                            tools.append(
+                                StructuredTool(
+                                    func=None,
+                                    name=func.__name__,
+                                    coroutine=func,
+                                    args_schema=self.create_pydantic_model_from_docstring(
+                                        func
+                                    ),
+                                    description=desc,
+                                )
+                            )
+                        self.SYSTEM_PROMPT_INJECTION += PROMPT_YouTube
                     if tool == "dummy_tool":
                         dummy_funcs = [
                             (
@@ -934,6 +1154,7 @@ class Pipe:
                         .replace("#small", "")
                         .replace("#online", "")
                         .replace("#wolfram", "")
+                        .replace("#youtube", "")
                         .replace("#no-tools", "")
                     )
 
@@ -1035,6 +1256,7 @@ class Pipe:
                     "#small",
                     "#online",
                     "#wolfram",
+                    "#youtube",
                     "#no-tools",
                 ]:
                     reasoning_context = reasoning_context.replace(tag, "")
@@ -1165,6 +1387,7 @@ class Pipe:
                         .replace("#small", "")
                         .replace("#online", "")
                         .replace("#wolfram", "")
+                        .replace("#youtube", "")
                         .replace("#no-tools", "")
                     )
 
