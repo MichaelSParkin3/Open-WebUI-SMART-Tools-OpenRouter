@@ -6,7 +6,7 @@ description: SMART is a sequential multi-agent reasoning technique. Uses OpenRou
 git_url: https://github.com/you/my-super-tool
 required_open_webui_version: 0.5.0
 requirements: langchain-openai, langgraph==0.2.60, requests, pydantic>=2
-version: 1.2-or
+version: 1.2
 licence: MIT
 """
 
