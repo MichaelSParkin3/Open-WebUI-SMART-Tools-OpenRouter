@@ -10,6 +10,78 @@ version: 1.5.0
 licence: MIT
 """
 
+# =================================================================================================
+# MODULE OVERVIEW
+# =================================================================================================
+# Purpose
+# -------
+# This file implements a “SMART” (Sequential Multi-Agent Reasoning Technique) pipeline designed
+# to run inside Open WebUI. It orchestrates multiple LLM “roles”:
+#
+#   1) Planner          – maps a user request to a plan: model choice, reasoning on/off, and tools.
+#   2) Reasoner         – performs structured internal planning (hidden thoughts) when requested.
+#   3) Tool-use agent   – executes tools (web search, scraping, Wolfram|Alpha, YouTube).
+#   4) User-interaction – generates the final answer streamed back to the user.
+#
+# This module uses OpenRouter’s OpenAI-compatible API via `langchain_openai.ChatOpenAI`,
+# and LangGraph’s prebuilt ReAct agent for tool calling.
+#
+# Audience
+# --------
+# - Programmers comfortable with Python and LangChain/LangGraph basics.
+# - Readers new to OpenRouter, multi-agent prompting, or prompt-engineering patterns
+#   (ReAct, planning vs. generation, toolformer-style calls).
+#
+# Mental Model
+# ------------
+# SMART uses tags in a planner’s output to *coordinate* which model to use, whether to reason,
+# and which tools are allowed. The “planner” writes: `#small|#medium|#large`, optionally
+# `#reasoning` (or `#no-reasoning`), and any tool flags: `#online`, `#wolfram`, `#youtube`.
+# The pipe then enforces that plan (with user override tags like `#!`, `#!!`, `#!!!`).
+#
+# Key Invariants & Contracts
+# --------------------------
+# - Never exceed a small, bounded number of tool calls per turn (3 for the internal tool agent,
+#   6 for the outer user-facing agent). This keeps latency and cost reasonable.
+# - If the plan requests tools but none are called (e.g., model fails to call tools), we provide
+#   a deterministic fallback (one web/youtube search) to avoid empty answers.
+# - Comments and prompts prioritize *why* decisions are made (intent) over narrating Python syntax.
+#
+# Security/Privacy Notes
+# ----------------------
+# - API keys are read from environment/valves; do not log secrets.
+# - `scrape_website` uses Jina Reader proxy (`https://r.jina.ai/<url>`). That external service
+#   will see URLs you fetch.
+# - YouTube Data API requests include your API key; keep it secret.
+#
+# Prompt-Engineering Notes (for readers new to this field)
+# --------------------------------------------------------
+# - “System instructions” are our strongest control surface. We:
+#   * separate roles (planner, reasoner, tool-use agent, user-interaction agent),
+#   * describe exact tag formats to make parsing easy and robust (XMLish tags),
+#   * put limits in the prompt (e.g., “NEVER make more than 3 tool calls”).
+# - Planning vs. Generation:
+#   * Plan first (cheaper/smaller model) to pick model/tooling.
+#   * Only do heavier “reasoning” on tasks that benefit (counting, logic, architecture).
+# - Tool discipline:
+#   * We instruct the agent to actually *use* results and to pass summaries forward (not raw blobs).
+#   * We cap tool calls and show tool results as citations/status in the UI.
+# - Cost/Latency control:
+#   * Map task difficulty to model size (mini/small/medium/large/huge).
+#   * Stream outputs where possible; trim long histories for planning context.
+#
+# Testing Guidance
+# ----------------
+# - Mock external HTTP calls (requests, google-api-python-client) for unit tests.
+# - Add contract tests for: planner tag parsing, user-override tags, tool caps, fallbacks.
+#
+# References
+# ----------
+# - ReAct prompting: “Reason+Act” interleaving for tool use.
+# - Toolformer (in spirit): model learns when to call tools.
+# - OpenRouter OpenAI-compatible API: https://openrouter.ai/docs
+# =================================================================================================
+
 import os
 import re
 import time
@@ -45,7 +117,11 @@ from youtube_transcript_api import (
 from googleapiclient.discovery import build
 from functools import lru_cache
 
-# ---------------------------------------------------------------
+# =================================================================================================
+# PROMPTS
+# =================================================================================================
+# The XML-like tags make parsing stable. Leading/trailing newlines are controlled to reduce
+# accidental whitespace capture when extracting sections.
 
 PLANNING_PROMPT = """<system_instructions>
 You are a planning Agent. You are part of an agent chain designed to make LLMs more capable.
@@ -89,6 +165,10 @@ Example response:
 </reasoning>
 <answer>#medium, #online ,#no-reasoning</answer>
 </system_instructions>"""
+# WHY: The planner converts open-ended user asks into a discrete “execution plan” we can enforce
+# (model size, reasoning flag, tools). Keeping the output structured reduces failure modes when
+# parsing with regex and enables stable downstream routing.
+
 
 REASONING_PROMPT = """<system_instructions>
 You are a reasoning layer of an LLM. You are part of the LLM designed for internal thought, planning, and thinking.
@@ -123,6 +203,11 @@ You will not directly interact with the user in any way. Only inform the output 
 6. Backtrack and restart from different points as often as you need to. Always consider alternative approaches.
 7. Validate your steps constantly. If you find a mistake, think about what the best point in your reasoning is to backtrack to. Don't be kind to yourself here. You need to critically analyze what you are doing.
 </system_instructions>"""
+# WHY: The reasoning agent is a private scaffold. It never talks to the user; its output is fed
+# into the final generator. This separation supports “plan then write” and makes failures easier
+# to debug. We also explicitly instruct *not* to emit code—only structure—so generation remains
+# in the final step.
+
 
 TOOL_PROMPT = """<system_instructions>
 You are the tool-use agent of an agent chain. You are the part of the LLM designed to use tools.
@@ -136,18 +221,25 @@ You need to output everything you want to pass on. The next agent in the chain w
 
 Please think about how best to call the tool first. Think about what the limitations of the tools are and how to best follow the reasoning agent's instructions. It's okay if you can't 100% produce what they wanted!
 </system_instructions>"""
+# WHY: We cap tool calls to keep cost/latency bounded and instruct the agent to summarize returns.
+# This emulates “toolformer” discipline—tools are a means to an end, not the end itself.
+
 
 USER_INTERACTION_PROMPT = """<system_instructions>
 You are the user-interaction agent of an agent chain. You are the part of the llm designed to interact with the user.
 
 You should follow the pre-prompt given to you within <preprompt> tags.
 </system_instructions>"""
+# WHY: The final agent focuses on UX: clear, concise answers that respect the upstream plan
+# and any injected pre-prompts (e.g., web search citation policy).
+
 
 USER_INTERACTION_REASONING_PROMPT = """You MUST follow the instructions given to you within <reasoning_output>/<instruction> tags.
 You MUST inform your answer by the reasoning within  <reasoning_output> tags.
 Carefully concider what the instructions mean and follow them EXACTLY."""
+# NOTE: Additional guardrails for stitching reasoner outputs into the final message.
 
-# --------------------------------------------------------------
+# --- Tool-specific pre-prompts injected when tools are enabled ---
 
 PROMPT_WebSearch = """<webSearchInstructions>
 Always cite your sources with ([Source Name](Link to source)), including the outer (), at the end of each paragraph! All information you take from external sources has to be cited!
@@ -161,23 +253,32 @@ Feel free to use the scrape_web function to get more specific information from o
 - Always cite at the end of a paragraph. Cite all sources refereced in the paragraph above. Do not cite within paragraphs.
 </sources_guidelines>
 </webSearchInstructions>"""
+# WHY: Web answers drift—citations protect users from hallucinations and improve trust.
 
 PROMPT_WolframAlpha = """<wolframInstructions>
 Wolfram|Alpha is an advanced computational knowledge engine and database with accurate scientific and real-time data.
 Keep queries concise (e.g., "integral of x^2", "weather Buenos Aires today"). Prefer simple inputs; do heavy plotting in Python (not available here).
 </wolframInstructions>"""
+# WHY: Push small, atomic queries for deterministic computation. Let the LLM format results.
 
 PROMPT_YouTube = """<youtubeInstructions>
 You have access to YouTube tools. You can search for videos and get their transcripts.
 When presenting results, always include the video title and a link to the video.
 For transcripts, mention the language of the transcript.
 </youtubeInstructions>"""
+# WHY: Consistent UX when surfacing video intelligence.
 
-
-# ---------------------------------------------------------------
+# =================================================================================================
 # YOUTUBE Pydantic Models
-# --------------------------------------------------------------
+# =================================================================================================
+
 class TranscriptDownloadResult(BaseModel):
+    """Structured return for YouTube transcript + metadata.
+
+    Contract:
+    - Always include `transcription` (possibly empty list) and `transcript_error` (empty if OK).
+    - `duration` uses ISO8601 per YouTube API (e.g., 'PT5M33S').
+    """
     video_id: str = Field(..., description="YouTube video ID")
     title: str = Field(..., description="Video title")
     channel: str = Field(..., description="Channel or author name")
@@ -196,6 +297,7 @@ class TranscriptDownloadResult(BaseModel):
 
 
 class SearchItem(BaseModel):
+    """Single YouTube search result with enriched stats."""
     video_id: str = Field(..., description="Unique YouTube video ID")
     title: str = Field(..., description="Video title")
     channel: str = Field(..., description="Channel or uploader name")
@@ -208,22 +310,28 @@ class SearchItem(BaseModel):
 
 
 class SearchResult(BaseModel):
+    """Container for a list of YouTube search results."""
     results: List[SearchItem] = Field(..., description="List of search results")
 
+# =================================================================================================
+# BRAVE SEARCH HELPERS
+# =================================================================================================
 
-# ---------------------------------------------------------------
-# TOOLS
-# --------------------------------------------------------------
-
-
-def remove_html_tags(text):
+def remove_html_tags(text: str) -> str:
+    """Strip HTML tags from text (best-effort; not an HTML sanitizer)."""
     clean = re.compile("<.*?>")
     return re.sub(clean, "", text)
 
 
-def decode_data(data):
-    results = []
+def decode_data(data: dict) -> List[dict]:
+    """Normalize Brave API payload into a compact list for the LLM.
+
+    Returns a homogeneous list of dicts with `type` keys in {"infobox","web","news","videos"}.
+    We keep only the most useful fields to reduce token usage later.
+    """
+    results: List[dict] = []
     try:
+        # --- Infobox hits (high-precision facts) ---
         try:
             if not data.get("infobox", {}).get("results"):
                 pass
@@ -244,11 +352,13 @@ def decode_data(data):
                 }
                 results.append(result_entry)
         except Exception as e:
+            # NOTE: Never fail the whole search due to one section.
             print("Error in parsing infobox results...", str(e))
 
+        # --- General web ---
         try:
             for i, result in enumerate(data.get("web", {}).get("results", [])):
-                if i >= 8:
+                if i >= 8:  # Keep top 8 for brevity
                     break
                 url = result.get("profile", {}).get("url") or result.get("url") or ""
                 title = remove_html_tags(result.get("title") or "")
@@ -281,6 +391,7 @@ def decode_data(data):
         except Exception as e:
             print("Error in parsing web results...", str(e))
 
+        # --- News ---
         try:
             for result in data.get("news", {}).get("results", []):
                 url = result.get("profile", {}).get(
@@ -306,6 +417,7 @@ def decode_data(data):
         except Exception as e:
             print("Error in parsing news results...", str(e))
 
+        # --- Videos (thin) ---
         try:
             for i, result in enumerate(data.get("videos", {}).get("results", [])):
                 if i >= 4:
@@ -336,7 +448,11 @@ def decode_data(data):
         return ["No search results from Brave (or an error occurred)..."]
 
 
-def search_brave(query, country, language, focus, SEARCH_KEY):
+def search_brave(query: str, country: str, language: str, focus: str, SEARCH_KEY: str):
+    """Call Brave Search API and decode to our compact shape.
+
+    :param focus: one of {"all","web","news","videos","reddit","academia","wikipedia"}
+    """
     results_filter = "infobox"
     if focus in ("web", "all"):
         results_filter += ",web"
@@ -345,6 +461,7 @@ def search_brave(query, country, language, focus, SEARCH_KEY):
     if focus == "videos":
         results_filter += ",videos"
 
+    # Goggles & site scoping
     goggles_id = ""
     if focus == "reddit":
         query = "site:reddit.com " + query
@@ -376,8 +493,9 @@ def search_brave(query, country, language, focus, SEARCH_KEY):
 
 
 def search_images_and_video(
-    query, country, media_type, freshness=None, SEARCH_KEY=None
+    query: str, country: str, media_type: str, freshness: Optional[str] = None, SEARCH_KEY: Optional[str] = None
 ):
+    """Image/Video search via Brave. `media_type` in {"images","videos"}."""
     encoded_query = urllib.parse.quote(query)
     url = f"https://api.search.brave.com/res/v1/{media_type}/search?q={encoded_query}&country={country}&search_lang=en&count=10"
     if (
@@ -391,14 +509,14 @@ def search_images_and_video(
     headers = {
         "Accept": "application/json",
         "Accept-Encoding": "gzip",
-        "X-Subscription-Token": SEARCH_KEY,
+        "X-Subscription-Token": SEARCH_KEY or "",
     }
 
     try:
         response = requests.get(url, headers=headers)
         data = response.json()
         if media_type == "images":
-            formatted_data = {}
+            formatted_data: Dict[str, dict] = {}
             for i, result in enumerate(data.get("results", []), start=1):
                 formatted_data[f"image{i}"] = {
                     "source": result.get("url"),
@@ -421,8 +539,9 @@ def searchWeb(
     country: str = "US",
     language: str = "en",
     focus: str = "all",
-    SEARCH_KEY=None,
+    SEARCH_KEY: Optional[str] = None,
 ):
+    """Unified search entry; forwards to Brave web/images/videos helpers."""
     if focus not in [
         "all",
         "web",
@@ -436,34 +555,39 @@ def searchWeb(
         focus = "all"
     try:
         if focus not in ["images", "videos"]:
-            results = search_brave(query, country, language, focus, SEARCH_KEY)
+            results = search_brave(query, country, language, focus, SEARCH_KEY or "")
         else:
             results = search_images_and_video(
                 query=query,
                 country=country,
                 media_type=focus,
                 freshness=None,
-                SEARCH_KEY=SEARCH_KEY,
+                SEARCH_KEY=SEARCH_KEY or "",
             )
     except Exception:
         return {"statusCode": 400, "body": json.dumps("Error fetching search results.")}
     return results
 
 
-# ---------------------------------------------------------------
+# =================================================================================================
+# EVENT EMITTER TYPES (Open WebUI streaming status/citations)
+# =================================================================================================
 
 EmitterType = Optional[Callable[[dict], Awaitable[None]]]
 
 
 class SendCitationType(Protocol):
+    """Callable signature for emitting 'citation' events to the UI."""
     def __call__(self, url: str, title: str, content: str) -> Awaitable[None]: ...
 
 
 class SendStatusType(Protocol):
+    """Callable signature for emitting 'status' events to the UI."""
     def __call__(self, status_message: str, done: bool) -> Awaitable[None]: ...
 
 
 def get_send_citation(__event_emitter__: EmitterType) -> SendCitationType:
+    """Return a function that emits a citation if the UI provides an emitter."""
     async def send_citation(url: str, title: str, content: str):
         if __event_emitter__ is None:
             return
@@ -471,9 +595,9 @@ def get_send_citation(__event_emitter__: EmitterType) -> SendCitationType:
             {
                 "type": "citation",
                 "data": {
-                    "document": [content],
+                    "document": [content],          # Text to show on expand
                     "metadata": [{"source": url, "html": False}],
-                    "source": {"name": title},
+                    "source": {"name": title},      # Label shown in the UI
                 },
             }
         )
@@ -482,6 +606,7 @@ def get_send_citation(__event_emitter__: EmitterType) -> SendCitationType:
 
 
 def get_send_status(__event_emitter__: EmitterType) -> SendStatusType:
+    """Return a function that emits a status line with a 'done' flag."""
     async def send_status(status_message: str, done: bool):
         if __event_emitter__ is None:
             return
@@ -496,11 +621,13 @@ def get_send_status(__event_emitter__: EmitterType) -> SendStatusType:
 
 
 # Helper: convert OpenWebUI dict messages to LC messages for direct model calls
-def to_lc_messages(messages: list[dict]):
+def to_lc_messages(messages: List[dict]):
+    """Convert OpenWebUI chat message dicts to LangChain message objects."""
     out = []
     for m in messages:
         role = m.get("role")
         content = m.get("content", "")
+        # Open WebUI may provide content as [{"type":"text","text":"..."}]
         if isinstance(content, list) and content and content[0].get("type") == "text":
             content = content[0].get("text", "")
         if role == "system":
@@ -512,8 +639,24 @@ def to_lc_messages(messages: list[dict]):
     return out
 
 
+# =================================================================================================
+# PIPE: main entry point for Open WebUI
+# =================================================================================================
+
 class Pipe:
+    """SMART pipe: registers a single “agent” and orchestrates plan→reason→tool→answer."""
+
     class Valves(BaseModel):
+        """Configuration surface exposed in Open WebUI.
+
+        Version/compatibility:
+        - Uses OpenRouter’s OpenAI-compatible endpoint (base_url).
+        - Supply site/app headers to comply with OpenRouter’s policy (optional but recommended).
+
+        Security:
+        - Keep all keys secret. Do not print or send to the model.
+        """
+
         try:
             OPENROUTER_API_KEY: str = Field(
                 default="", description="OpenRouter API key"
@@ -580,8 +723,10 @@ class Pipe:
             traceback.print_exc()
 
     def __init__(self):
+        """Initialize valves, set environment fallbacks, and cache OpenRouter headers."""
         try:
             self.type = "manifold"
+            # Load valves from env when unset (Open WebUI behavior)
             self.valves = self.Valves(
                 **{
                     k: os.getenv(k, v.default)
@@ -602,7 +747,8 @@ class Pipe:
         except Exception:
             traceback.print_exc()
 
-    def pipes(self) -> list[dict[str, str]]:
+    def pipes(self) -> List[Dict[str, str]]:
+        """Register this pipe as a single agent in Open WebUI."""
         try:
             self.setup()
         except Exception as e:
@@ -611,13 +757,15 @@ class Pipe:
         return [{"id": self.valves.AGENT_ID, "name": self.valves.AGENT_NAME}]
 
     def setup(self):
+        """Validate config at start of each run; reset per-turn injections."""
         v = self.valves
         if not v.OPENROUTER_API_KEY:
             raise Exception("Error: OPENROUTER_API_KEY is not set")
         self.SYSTEM_PROMPT_INJECTION = ""
 
     def _openrouter_headers(self) -> Dict[str, str]:
-        headers = {}
+        """Optional OpenRouter headers (HTTP-Referer/X-Title) for compliance/analytics."""
+        headers: Dict[str, str] = {}
         if self.valves.OPENROUTER_SITE_URL:
             headers["HTTP-Referer"] = self.valves.OPENROUTER_SITE_URL
         if self.valves.OPENROUTER_APP_TITLE:
@@ -626,39 +774,53 @@ class Pipe:
 
     # ---------- Utility: safety-normalize potentially risky phrasing ----------
     def _normalize_for_safety(self, text: str) -> str:
+        """Lightweight normalization to reduce accidental safety triggers.
+
+        Example: replaces 'girls' -> 'women (18+)' in model/tool prompts.
+        This does *not* sanitize content; it only defuses common false positives.
+        """
         if not isinstance(text, str):
             return text
-        # Reduce chance of minors-related safety triggers in model/tool prompts
         return re.sub(r"\bgirls\b", "women (18+)", text, flags=re.IGNORECASE)
 
-    # ---------- Tools (async) ----------
+    # ------------------------------------------------------------------------------------------------
+    # TOOLS (async) – exposed to the ReAct agent
+    # ------------------------------------------------------------------------------------------------
 
     async def search_web(
         self, query: str, country: str = "US", language: str = "en", focus: str = "all"
     ):
-        """Search via Brave.
+        """Search via Brave and return compact JSON for the LLM.
+
         :param query: Search query text
         :param country: Two-letter country code (e.g., US)
-        :param language: Language code (e.g., en)
+        :param language: Language code (e.g., en) – currently unused by Brave API call here
         :param focus: one of all|web|news|wikipedia|academia|reddit|images|videos
+
+        Notes (Prompt-eng):
+        - Keep queries specific; use site: filters (see `focus` tweaks).
+        - Use web search sparingly; prefer scraping a specific page after finding it.
         """
         query = self._normalize_for_safety(query)
+        # FIX: earlier versions referenced `Brave_SEARCH_KEY` (typo). Use `BRAVE_SEARCH_KEY`.
         results = searchWeb(
             query,
             country,
             language,
             focus,
-            (
-                self.valves.Brave_SEARCH_KEY
-                if hasattr(self.valves, "Brave_SEARCH_KEY")
-                else self.valves.BRAVE_SEARCH_KEY
-            ),
+            self.valves.BRAVE_SEARCH_KEY,
         )
         return json.dumps(results)
 
     async def scrape_website(self, url: str) -> str:
-        """Scrape page text via Jina Reader.
+        """Scrape page text via Jina Reader proxy (https://r.jina.ai/<url>).
+
         :param url: Full http(s) URL to fetch
+        :returns: Raw text with a footer reminding the agent to cite the r.jina.ai link
+
+        Pitfalls:
+        - Some sites block readers/proxies; handle empty outputs gracefully.
+        - Consider rate limits; we do single fetches, not crawls.
         """
         try:
             baseURL = f"https://r.jina.ai/{url}"
@@ -674,7 +836,12 @@ class Pipe:
 
     async def wolframAlpha(self, query: str) -> str:
         """Query Wolfram|Alpha lightweight LLM API.
+
         :param query: Short natural language query
+
+        Prompt-eng note:
+        - Ask for atomic facts or evaluations (integrals, unit conversions, weather).
+        - Let the final agent format/interpret; don't over-specify here.
         """
         try:
             baseURL = f"https://www.wolframalpha.com/api/v1/llm-api?appid={self.valves.WOLFRAMALPHA_APP_ID}&input="
@@ -691,11 +858,14 @@ class Pipe:
             return "Error fetching Wolfram|Alpha results."
 
     # ---------- YouTube Tools ----------
+
     def _get_supported_languages(self) -> List[str]:
+        """Internal: language whitelist for transcripts."""
         return ["en", "es"]
 
     def _extract_transcript_text(self, transcript_data) -> List[str]:
-        texts = []
+        """Internal: normalize transcript entries (dict or objects) to a list of strings."""
+        texts: List[str] = []
         for segment in transcript_data:
             if isinstance(segment, dict):
                 texts.append(segment.get("text", ""))
@@ -704,6 +874,10 @@ class Pipe:
         return texts
 
     def _fetch_transcript(self, video_id: str) -> tuple[List[str], str, str]:
+        """Internal: attempt transcript fetch across supported languages.
+
+        :returns: (transcription, language_code, error_message)
+        """
         transcription, lang_code, err_msg = [], "", ""
         try:
             transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
@@ -720,9 +894,14 @@ class Pipe:
         return transcription, lang_code, err_msg
 
     async def get_youtube_transcript(self, video_id: str) -> str:
-        """
-        Download metadata and full transcript for a given YouTube video.
+        """Download metadata and (if available) full transcript for a YouTube video.
+
         :param video_id: The ID of the YouTube video.
+        :returns: `TranscriptDownloadResult` JSON
+
+        Operational notes:
+        - Requires `YOUTUBE_API_KEY`.
+        - Transcript may be empty due to disabled captions or unsupported language.
         """
         transcription, language_code, error_message = self._fetch_transcript(video_id)
 
@@ -757,6 +936,7 @@ class Pipe:
 
     @lru_cache(maxsize=128)
     def _search_youtube_logic(self, query: str, max_results: int) -> List[Dict]:
+        """Internal: YouTube search + details fetch (cached by args)."""
         if not 1 <= max_results <= 50:
             raise ValueError("max_results must be between 1 and 50")
 
@@ -803,10 +983,10 @@ class Pipe:
         return results
 
     async def youtube_search(self, query: str, max_results: int = 5) -> str:
-        """
-        Search YouTube for videos.
-        :param query: The search query.
-        :param max_results: The maximum number of results to return (1-50).
+        """Search YouTube for videos and return `SearchResult` JSON.
+
+        Prompt-eng tip:
+        - Prefer precise queries (channel names, time windows) to reduce noise.
         """
         try:
             query = self._normalize_for_safety(query)
@@ -823,9 +1003,14 @@ class Pipe:
 
     # ---------- Pydantic schema builder (fixed) ----------
     def create_pydantic_model_from_docstring(self, func):
+        """Generate a Pydantic model for tool args from a function’s annotations/docstring.
+
+        Why:
+        - StructuredTool requires a schema; we auto-derive it so tool registration stays DRY.
+        """
         doc = inspect.getdoc(func) or ""
         # Parse :param name: description (optional, for nicer help text)
-        param_descriptions = {}
+        param_descriptions: Dict[str, str] = {}
         for line in doc.split("\n"):
             if ":param " in line:
                 try:
@@ -854,7 +1039,9 @@ class Pipe:
 
         return create_model(f"{func.__name__}Args", **fields)
 
-    # -----------------------------------------------------
+    # ------------------------------------------------------------------------------------------------
+    # MAIN PIPE
+    # ------------------------------------------------------------------------------------------------
 
     async def pipe(
         self,
@@ -862,25 +1049,53 @@ class Pipe:
         __request__: Request,
         __user__: dict | None,
         __task__: str | None,
-        __tools__: dict[str, dict] | None,
+        __tools__: Dict[str, dict] | None,
         __event_emitter__: Callable[[dict], Awaitable[None]] | None,
     ) -> AsyncGenerator:
+        """Orchestrate a single turn from Open WebUI.
+
+        High-level Steps
+        ----------------
+        1) Title generation (special task) – produce concise chat titles.
+        2) Planning – choose model size, tools, and whether we need a reasoning pass.
+           - User overrides via tags in the last message: #! (small), #!! (medium), #!!! (large),
+             #yes/#no to force reasoning on/off, #no-tools to forbid tool use, or #online/#youtube/#wolfram to force tools.
+        3) Execution paths:
+           a) No-Reasoning → ReAct agent with optional tools → stream final answer.
+           b) Reasoning → run reasoning model, optionally call a tool-use agent, stitch results into
+              the user-interaction prompt, then ReAct agent for the final answer.
+        4) Fallbacks – if plan requested tools but none were called, perform a single deterministic
+           search to avoid empty answers.
+
+        Constraints & Limits
+        --------------------
+        - External tool calls: max ~6 (outer agent) or 3 (internal tool agent).
+        - Web answers should cite sources (web prompt injection enforces this policy).
+        - We stream tokens and emit status/citation events for observability.
+
+        Returns
+        -------
+        - Async generator yielding text chunks for streaming to the UI.
+        """
         try:
             if __task__ == "function_calling":
+                # Open WebUI internal task – nothing to do here.
                 return
 
             self.setup()
             start_time = time.time()
 
+            # --- Resolve model IDs from valves ---
             mini_model_id = self.valves.MINI_MODEL
             small_model_id = self.valves.SMALL_MODEL
             medium_model_id = self.valves.MEDIUM_MODEL
             large_model_id = self.valves.LARGE_MODEL
-            huge_model_id = self.valves.HUGE_MODEL
+            huge_model_id = self.valves.HUGE_MODEL  # Reserved for future use
             planning_model_id = self.valves.PLANNING_MODEL
 
             # --- OpenRouter models via OpenAI-compatible ChatOpenAI ---
             def LLM(model_id: str) -> ChatOpenAI:
+                """Factory: create a chat model bound to OpenRouter with our headers."""
                 return ChatOpenAI(
                     model=model_id,
                     base_url=self.valves.OPENROUTER_BASE_URL,
@@ -893,13 +1108,16 @@ class Pipe:
             medium_model = LLM(medium_model_id)
             large_model = LLM(large_model_id)
 
-            config = {}
+            config = {}  # Placeholder for future per-call config (LLM kwargs, tags, etc.)
 
+            # ----------------------------------------------------------------------------------------
+            # SPECIAL TASK: chat title generation
+            # ----------------------------------------------------------------------------------------
             if __task__ == "title_generation":
                 # Build a short context from the last user/assistant messages
                 last_msgs = body.get("messages", [])[-4:]
                 lc_msgs = to_lc_messages(last_msgs)
-                # Simple heuristic: ask for a concise chat title
+                # Ask for a concise title
                 title_prompt = [
                     SystemMessage(
                         content="Write a concise 3–6 word title for this conversation. No quotes."
@@ -910,12 +1128,14 @@ class Pipe:
                 yield content.strip()
                 return
 
+            # Prepare UI emitters
             send_citation = get_send_citation(__event_emitter__)
             send_status = get_send_status(__event_emitter__)
 
-            #
-            # STEP 1: Planning (with safety-normalization for the last user message)
-            #
+            # ----------------------------------------------------------------------------------------
+            # STEP 1: PLANNING
+            # ----------------------------------------------------------------------------------------
+            # Concatenate the conversation into a compact text with the last user message normalized
             combined_message = ""
             msgs = body["messages"]
             for idx, message in enumerate(msgs):
@@ -926,6 +1146,7 @@ class Pipe:
                     text_src = message_content
                     if idx == len(msgs) - 1:  # normalize last user message
                         text_src = self._normalize_for_safety(text_src)
+                    # Trim long messages (show head/tail) to control prompt size
                     if len(text_src) > 1000:
                         mssg_length = len(text_src)
                         content_to_use = (
@@ -940,6 +1161,7 @@ class Pipe:
                     else:
                         content_to_use = text_src
                 elif isinstance(message_content, list):
+                    # Handle Open WebUI structured content
                     for part in message_content:
                         if part.get("type") == "text":
                             text = part.get("text", "")
@@ -971,10 +1193,11 @@ class Pipe:
                 planning_buffer += content
             content = planning_buffer
 
+            # Extract the planning <answer> tag with CSV of hashtags
             csv_hastag_list = re.findall(r"<answer>(.*?)</answer>", content)
             csv_hastag_list = csv_hastag_list[0] if csv_hastag_list else "unknown"
 
-            # model selection (map #medium -> medium, #large -> large)
+            # Model selection (map #mini/#small/#medium/#large -> IDs)
             if "#mini" in csv_hastag_list:
                 model_to_use_id = mini_model_id
             elif "#small" in csv_hastag_list:
@@ -984,11 +1207,12 @@ class Pipe:
             elif "#large" in csv_hastag_list:
                 model_to_use_id = large_model_id
             else:
-                model_to_use_id = small_model_id
+                model_to_use_id = small_model_id  # sensible default
 
             is_reasoning_needed = "YES" if "#reasoning" in csv_hastag_list else "NO"
 
-            tool_list = []
+            # Tool plan (allow #no-tools override in last message)
+            tool_list: List[str] = []
             last_msg_content = body["messages"][-1]["content"]
             allow_tools = True
             if isinstance(last_msg_content, str):
@@ -1038,13 +1262,14 @@ class Pipe:
                 ):
                     tool_list.append("youtube")
 
+            # Emit planning debug info to the UI (as a “citation” block)
             await send_citation(
                 url=f"SMART Planning",
                 title="SMART Planning",
                 content=f"{content=}",
             )
 
-            # user overrides
+            # User overrides (#!/#!!/#!!! for model; #yes/#no for reasoning)
             if isinstance(last_msg_content, str):
                 lm = last_msg_content
             else:
@@ -1066,6 +1291,7 @@ class Pipe:
             elif "#*no" in lm or "#no" in lm:
                 is_reasoning_needed = "NO"
 
+            # Ensure we register at least one tool when using large model (keeps it useful)
             if model_to_use_id == large_model_id and len(tool_list) == 0:
                 tool_list.append("dummy_tool")
 
@@ -1074,7 +1300,10 @@ class Pipe:
                 done=True,
             )
 
-            # Collect tools: include any OpenWebUI-provided __tools__ plus our built-ins
+            # ----------------------------------------------------------------------------------------
+            # TOOL REGISTRATION
+            # ----------------------------------------------------------------------------------------
+            # Collect tools: include Open WebUI-provided `__tools__` plus our built-ins.
             tools = []
             if __tools__:
                 for key, value in __tools__.items():
@@ -1088,6 +1317,7 @@ class Pipe:
                         )
                     )
 
+            # Build structured tools from our coroutines based on plan
             if len(tool_list) > 0:
                 for tool in tool_list:
                     if tool == "online":
@@ -1134,7 +1364,7 @@ class Pipe:
                             (
                                 self.youtube_search,
                                 "Search YouTube for videos.",
-                            ),  # fixed+renamed
+                            ),
                             (
                                 self.get_youtube_transcript,
                                 "Get the transcript of a YouTube video.",
@@ -1173,7 +1403,7 @@ class Pipe:
                                 )
                             )
 
-            # Log which tools are registered (visibility)
+            # Visibility: tell the UI which tools the agent registered
             try:
                 await send_status(f"Registered tools: {[t.name for t in tools]}", False)
             except Exception:
@@ -1184,8 +1414,11 @@ class Pipe:
             messages_to_use = body["messages"]
             last_message_json = isinstance(messages_to_use[-1].get("content", ""), list)
 
-            # Fast path: NO reasoning
+            # ----------------------------------------------------------------------------------------
+            # FAST PATH: NO REASONING
+            # ----------------------------------------------------------------------------------------
             if is_reasoning_needed == "NO":
+                # If tools were planned, force at least one tool call; otherwise, explicitly allow no tools.
                 FORCE_TOOLS = ""
                 if tool_list:
                     FORCE_TOOLS = (
@@ -1194,6 +1427,7 @@ class Pipe:
                         "reply exactly with: TOOL_UNAVAILABLE.\n"
                     )
 
+                # Inject final-agent pre-prompts & tool pre-prompts
                 messages_to_use[0]["content"] = (
                     messages_to_use[0]["content"]
                     + USER_INTERACTION_PROMPT
@@ -1201,7 +1435,7 @@ class Pipe:
                     + FORCE_TOOLS
                 )
 
-                # sanitize control tags from final user message and normalize
+                # Sanitize control tags from user input
                 def strip_tags(txt: str) -> str:
                     return (
                         str(txt)
@@ -1230,6 +1464,7 @@ class Pipe:
                     )
                     messages_to_use[-1]["content"][0]["text"] = strip_tags(norm)
 
+                # Create a ReAct agent with registered tools
                 graph = create_react_agent(model_to_use, tools=tools)
                 inputs = {"messages": body["messages"]}
 
@@ -1271,7 +1506,7 @@ class Pipe:
                             content=str(data),
                         )
 
-                # Deterministic fallback if planner wanted tools but none were called
+                # Fallback: planner wanted tools but none were called
                 if num_tool_calls == 0 and tool_list:
                     # Pull normalized, stripped user text
                     if isinstance(lm, str):
@@ -1299,11 +1534,14 @@ class Pipe:
                 )
                 return
 
-            # Reasoning path
+            # ----------------------------------------------------------------------------------------
+            # REASONING PATH
+            # ----------------------------------------------------------------------------------------
             elif is_reasoning_needed == "YES":
                 reasoning_model_id = self.valves.REASONING_MODEL
                 reasoning_model = LLM(reasoning_model_id)
 
+                # Compact history for the reasoner (user and assistant snippets)
                 reasoning_context = ""
                 for msg in body["messages"][:-1]:
                     if msg["role"] == "user":
@@ -1337,6 +1575,7 @@ class Pipe:
                 elif last_msg["role"] == "user":
                     reasoning_context += f"--- LAST USER MESSAGE/PROMPT ---\n{self._normalize_for_safety(last_msg['content'][0]['text'])}"
 
+                # Remove control tags from the context the reasoner sees
                 for tag in [
                     "#*yes",
                     "#*no",
@@ -1395,6 +1634,7 @@ class Pipe:
                     content=f"{reasoning_content=}",
                 )
 
+                # If the reasoner asked for tools, run a mini tool-use agent
                 tool_agent_content = re.findall(
                     r"<ask_tool_agent>(.*?)</ask_tool_agent>",
                     reasoning_content,
@@ -1477,7 +1717,7 @@ class Pipe:
 
                 await send_status(status_message="Reasoning complete.", done=True)
 
-                # Stitch reasoning context into final call
+                # Stitch reasoning context into final call (final agent sees both)
                 def strip_tags(txt: str) -> str:
                     return (
                         str(txt)
@@ -1573,7 +1813,7 @@ class Pipe:
                             content=str(data),
                         )
 
-                # Deterministic fallback if planner wanted tools but none were called
+                # Fallback if planner mandated tools but none were called
                 if num_tool_calls == 0 and tool_list:
                     if isinstance(lm, str):
                         qtxt = lm
@@ -1600,11 +1840,13 @@ class Pipe:
                         done=True,
                     )
                 return
+
             else:
                 yield "Error: is_reasoning_needed is not YES or NO"
                 return
 
         except Exception as e:
+            # Final catch-all (won’t crash the WebUI) – include message but not stack trace in stream
             yield "Error: " + str(e)
             traceback.print_exc()
             return
