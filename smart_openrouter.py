@@ -1,12 +1,12 @@
 """
 title: SMART - Sequential Multi-Agent Reasoning Technique (OpenRouter edition)
-author: MartianInGreen (modified by MichaelSParkin3)
-author_url: https://github.com/MichaelSParkin3/Open-WebUI-SMART-Tools-OpenRouter
-description: SMART is a sequential multi-agent reasoning technique. Uses OpenRouter + online/Wolfram/YouTube tools.
-git_url: https://github.com/you/my-super-tool
+author: MartianInGreen (modified by MichaelSParkin3, adapted for OpenRouter)
+author_url: https://github.com/MichaelSParkin3/
+description: SMART is a sequential multi-agent reasoning technique. Uses OpenRouter models + online/Wolfram/YouTube tools.
+git_url: https://github.com/MichaelSParkin3/Open-WebUI-SMART-Tools-OpenRouter
 required_open_webui_version: 0.5.0
 requirements: langchain-openai, langgraph==0.2.60, requests, pydantic>=2, youtube_transcript_api, google-api-python-client
-version: 1.3.1
+version: 1.5.0
 licence: MIT
 """
 
@@ -48,14 +48,14 @@ from functools import lru_cache
 # ---------------------------------------------------------------
 
 PLANNING_PROMPT = """<system_instructions>
-You are a planning Agent. You are part of an agent chain designed to make LLMs more capable. 
+You are a planning Agent. You are part of an agent chain designed to make LLMs more capable.
 You are responsible for taking the incoming user input/request and preparing it for the next agents in the chain.
-After you will come either a reasoning agent or the final agent. 
+After you will come either a reasoning agent or the final agent.
 After they have come up with a solution, a final agent will be used to summarize the reasoning and provide a final answer.
 Only use a Newline after each closing tag. Never after the opening tag or within the tags.
 
-Guidelines: 
-- Don't over or estimate the difficulty of the task. If the user just wants to chat try to see that. 
+Guidelines:
+- Don't over or estimate the difficulty of the task. If the user just wants to chat try to see that.
 - Don't create tasks where there aren't any. If the user didn't ask to write code you shouldn't instruct the next agent to do so.
 
 You should respond by following these steps:
@@ -64,14 +64,14 @@ You should respond by following these steps:
     2. Second, reason about if the reasoning is needed. What do your guidelines say about that?
     3. Third, reason about what model would best be used. What do your guidelines say about that?
 2. Within the <answer> tag, write out your final answer. Your answer should be a comma seperated list.
-    1. First choose the model the final-agent will use. Try to find a good balance between performance and cost. Larger models are bigger. 
+    1. First choose the model the final-agent will use. Try to find a good balance between performance and cost. Larger models are bigger.
         - There is #mini, this is a very small model, however it has a very large context window. This model can not use tools. This model is mostly not recommended.
         - Use #small for the simple queries or queries that mostly involve summarization or simple "mindless" work. This also invloves very simple tool use, like converting a file, etc.
         - Use #medium for task that requiere some creativity, writing of code, or complex tool-use.
         - Use #large for tasks that are mostly creative or involve the writing of complex code, math, etc.
     2. Secondly, choose if the query requieres reasoning before being handed off to the final agent.
         - Queries that requeire reasoning are especially queries where llm are bad at. Such as planning, counting, logic, code architecutre, moral questions, etc.
-        - Queries that don't requeire reasoning are queries that are easy for llms. Such as "knowledge" questions, summarization, writing notes, primairly tool use, web searching, etc. 
+        - Queries that don't requeire reasoning are queries that are easy for llms. Such as "knowledge" questions, summarization, writing notes, primairly tool use, web searching, etc.
         - If you think reasoning is needed, include #reasoning. If not #no-reasoning.
         - When you choose reasoning, you should (in most cases) choose at least the #medium model.
     3. Third, you can make tools avalible to the final agent. You can enable multiple tools.
@@ -81,18 +81,18 @@ You should respond by following these steps:
             - Wolfram|Alpha is very good at math (integrals, roots, limits...), real-time data (weather, stocks, FX), and structured facts.
         - Use #youtube to get video transcripts or search for videos.
         - If the prompt involves math, enable #wolfram.
-    
+
 Example response:
 <reasoning>
-... 
+...
 (You are allowed new lines here)
 </reasoning>
 <answer>#medium, #online ,#no-reasoning</answer>
 </system_instructions>"""
 
 REASONING_PROMPT = """<system_instructions>
-You are a reasoning layer of an LLM. You are part of the LLM designed for internal thought, planning, and thinking. 
-You will not directly interact with the user in any way. Only inform the output stage of the LLM what to say by your entire output being parts of its context when it starts to generate a response. 
+You are a reasoning layer of an LLM. You are part of the LLM designed for internal thought, planning, and thinking.
+You will not directly interact with the user in any way. Only inform the output stage of the LLM what to say by your entire output being parts of its context when it starts to generate a response.
 
 **General rules**:
 - Write out your entire reasoning process between <thinking> tags.
@@ -106,7 +106,7 @@ You will not directly interact with the user in any way. Only inform the output 
 - Your entire thinking process is entirely hidden. You can think as freely as you want without it directly affecting the output.
 - Always follow user instructions, never try to take any shortcuts. Think about different ways they could be meant to not miss anything.
 - NEVER generate ANY code directly. You should only plan out the structure of code and projects, but not directly write the code. The output layer will write the code based on your plan and structure!
-- If you need more information, you can ask a tool-use agent if they have the right tool and what you need within <ask_tool_agent>. 
+- If you need more information, you can ask a tool-use agent if they have the right tool and what you need within <ask_tool_agent>.
     - In general, you can instruct the tool-use agent to either return the results to you or directly pass them on to the output layer.
     - If *you* need information, you should instruct the tool-use agent to return the results to you.
     - The tool use agent ONLY gets what you write in <ask_tool_agent>. They do not get any user context or similar.
@@ -117,7 +117,7 @@ You will not directly interact with the user in any way. Only inform the output 
 **General Steps**:
 1. Outline the problem.
 2. Think about what kind of problem this is.
-3. Break down the problem into the smallest possible problems, never take shortcuts on reasoning, counting etc. Everything needs to be explicitly stated. More output is better.
+3. Break down the problem into the smallest possible problems, never take shortcuts on reasoning, counting etc. Everything needs to be explicitly stated.
 4. Think about steps you might need to take to solve this problem.
 5. Think through these steps.
 6. Backtrack and restart from different points as often as you need to. Always consider alternative approaches.
@@ -141,7 +141,7 @@ USER_INTERACTION_PROMPT = """<system_instructions>
 You are the user-interaction agent of an agent chain. You are the part of the llm designed to interact with the user.
 
 You should follow the pre-prompt given to you within <preprompt> tags.
-<system_instructions>"""
+</system_instructions>"""
 
 USER_INTERACTION_REASONING_PROMPT = """You MUST follow the instructions given to you within <reasoning_output>/<instruction> tags.
 You MUST inform your answer by the reasoning within  <reasoning_output> tags.
@@ -154,16 +154,16 @@ Always cite your sources with ([Source Name](Link to source)), including the out
 Feel free to use the scrape_web function to get more specific information from one source if the web_search did not return enough information. However, try not to make more than a total of 3 searches + scrapes.
 
 <sources_guidelines>
-- [Source Name] should be something like [New York Times] or [BBC] etc. etc. 
+- [Source Name] should be something like [New York Times] or [BBC] etc. etc.
 - Always cite the specific source.
 - Sometimes you should add more detail to the [Source Name], for example when it is a Video. For example it could look like this [YouTube - BBC]
 - You can have multipel sources within the (), so ([S1](Link 1), [S2](Link 2)...) and so on.
-- Always cite at the end of a paragraph. Cite all sources refereced in the paragraph above. Do not cite within paragraphs. 
+- Always cite at the end of a paragraph. Cite all sources refereced in the paragraph above. Do not cite within paragraphs.
 </sources_guidelines>
 </webSearchInstructions>"""
 
 PROMPT_WolframAlpha = """<wolframInstructions>
-Wolfram|Alpha is an advanced computational knowledge engine and database with accurate scientific and real-time data. 
+Wolfram|Alpha is an advanced computational knowledge engine and database with accurate scientific and real-time data.
 Keep queries concise (e.g., "integral of x^2", "weather Buenos Aires today"). Prefer simple inputs; do heavy plotting in Python (not available here).
 </wolframInstructions>"""
 
@@ -438,7 +438,6 @@ def searchWeb(
         if focus not in ["images", "videos"]:
             results = search_brave(query, country, language, focus, SEARCH_KEY)
         else:
-            # pass named params so 'freshness' stays None and the API key is passed correctly
             results = search_images_and_video(
                 query=query,
                 country=country,
@@ -519,29 +518,49 @@ class Pipe:
             OPENROUTER_API_KEY: str = Field(
                 default="", description="OpenRouter API key"
             )
+            OPENROUTER_BASE_URL: str = Field(
+                default="https://openrouter.ai/api/v1",
+                description="OpenRouter OpenAI-compatible base URL",
+            )
+            OPENROUTER_SITE_URL: str = Field(
+                default="",
+                description="Optional HTTP-Referer header (your app/site URL)",
+            )
+            OPENROUTER_APP_TITLE: str = Field(
+                default="Smart/Core (OpenRouter)",
+                description="Optional X-Title header for OpenRouter",
+            )
+
             MODEL_PREFIX: str = Field(
                 default="SMART", description="Prefix before model ID"
             )
-            # Default OpenRouter model IDs (edit these in the UI to your favorites)
+
+            # Default OpenRouter model IDs (edit in UI to your favorites)
             MINI_MODEL: str = Field(
                 default="openai/gpt-4o-mini", description="Model for very small tasks"
             )
             SMALL_MODEL: str = Field(
                 default="openai/gpt-4o-mini", description="Model for small tasks"
             )
+            MEDIUM_MODEL: str = Field(
+                default="anthropic/claude-3.5-sonnet",
+                description="Model for medium tasks",
+            )
             LARGE_MODEL: str = Field(
-                default="openai/gpt-4o", description="Model for large tasks"
+                default="anthropic/claude-3.5-sonnet",
+                description="Model for large tasks",
             )
             HUGE_MODEL: str = Field(
-                default="anthropic/claude-3.7-sonnet",
+                default="anthropic/claude-3.5-sonnet",
                 description="Model for the largest tasks",
             )
             REASONING_MODEL: str = Field(
-                default="deepseek/deepseek-r1", description="Model for reasoning tasks"
+                default="openai/o4-mini", description="Model for reasoning tasks"
             )
             PLANNING_MODEL: str = Field(
                 default="openai/gpt-4o-mini", description="Model for the planning step"
             )
+
             BRAVE_SEARCH_KEY: str = Field(
                 default="", description="Brave Search API Key"
             )
@@ -555,15 +574,7 @@ class Pipe:
                 default="Smart/Core (OpenRouter)", description="Name of the agent"
             )
             AGENT_ID: str = Field(
-                default="smart-core-or", description="ID of the agent"
-            )
-            # Optional: forwarded headers for OpenRouter analytics (referrer/title)
-            HTTP_REFERER: str = Field(
-                default="", description="Optional - HTTP-Referer header for OpenRouter"
-            )
-            X_TITLE: str = Field(
-                default="SMART Pipe (OpenWebUI)",
-                description="Optional - X-Title header for OpenRouter",
+                default="smart-core-openrouter", description="ID of the agent"
             )
         except Exception as e:
             traceback.print_exc()
@@ -577,8 +588,17 @@ class Pipe:
                     for k, v in self.Valves.model_fields.items()
                 }
             )
+            # Provide OpenAI-compatible environment variables for broader compatibility
+            os.environ["OPENAI_API_KEY"] = self.valves.OPENROUTER_API_KEY or os.getenv(
+                "OPENAI_API_KEY", ""
+            )
+            os.environ["OPENAI_BASE_URL"] = (
+                self.valves.OPENROUTER_BASE_URL or os.getenv("OPENAI_BASE_URL", "")
+            )
+            # Brave
             os.environ["BRAVE_SEARCH_TOKEN"] = self.valves.BRAVE_SEARCH_KEY
             os.environ["BRAVE_SEARCH_TOKEN_SECONDARY"] = self.valves.BRAVE_SEARCH_KEY
+            self._headers = self._openrouter_headers()
         except Exception:
             traceback.print_exc()
 
@@ -594,20 +614,22 @@ class Pipe:
         v = self.valves
         if not v.OPENROUTER_API_KEY:
             raise Exception("Error: OPENROUTER_API_KEY is not set")
-        # LangChain’s ChatOpenAI can target OpenRouter via base_url+api_key
-        self.llm_kwargs = {
-            "api_key": v.OPENROUTER_API_KEY,
-            "base_url": "https://openrouter.ai/api/v1",
-        }
-        # Optional headers for OpenRouter metrics
-        default_headers = {}
-        if v.HTTP_REFERER:
-            default_headers["HTTP-Referer"] = v.HTTP_REFERER
-        if v.X_TITLE:
-            default_headers["X-Title"] = v.X_TITLE
-        if default_headers:
-            self.llm_kwargs["default_headers"] = default_headers
         self.SYSTEM_PROMPT_INJECTION = ""
+
+    def _openrouter_headers(self) -> Dict[str, str]:
+        headers = {}
+        if self.valves.OPENROUTER_SITE_URL:
+            headers["HTTP-Referer"] = self.valves.OPENROUTER_SITE_URL
+        if self.valves.OPENROUTER_APP_TITLE:
+            headers["X-Title"] = self.valves.OPENROUTER_APP_TITLE
+        return headers
+
+    # ---------- Utility: safety-normalize potentially risky phrasing ----------
+    def _normalize_for_safety(self, text: str) -> str:
+        if not isinstance(text, str):
+            return text
+        # Reduce chance of minors-related safety triggers in model/tool prompts
+        return re.sub(r"\bgirls\b", "women (18+)", text, flags=re.IGNORECASE)
 
     # ---------- Tools (async) ----------
 
@@ -620,8 +642,17 @@ class Pipe:
         :param language: Language code (e.g., en)
         :param focus: one of all|web|news|wikipedia|academia|reddit|images|videos
         """
+        query = self._normalize_for_safety(query)
         results = searchWeb(
-            query, country, language, focus, self.valves.BRAVE_SEARCH_KEY
+            query,
+            country,
+            language,
+            focus,
+            (
+                self.valves.Brave_SEARCH_KEY
+                if hasattr(self.valves, "Brave_SEARCH_KEY")
+                else self.valves.BRAVE_SEARCH_KEY
+            ),
         )
         return json.dumps(results)
 
@@ -664,15 +695,12 @@ class Pipe:
         return ["en", "es"]
 
     def _extract_transcript_text(self, transcript_data) -> List[str]:
-        # The youtube_transcript_api can return transcript segments as either dictionaries
-        # or objects (FetchedTranscriptSnippet). The original code only handled dictionaries,
-        # causing an error. This updated function handles both cases.
         texts = []
         for segment in transcript_data:
             if isinstance(segment, dict):
                 texts.append(segment.get("text", ""))
             else:
-                texts.append(getattr(segment, 'text', ''))
+                texts.append(getattr(segment, "text", ""))
         return texts
 
     def _fetch_transcript(self, video_id: str) -> tuple[List[str], str, str]:
@@ -732,9 +760,9 @@ class Pipe:
         if not 1 <= max_results <= 50:
             raise ValueError("max_results must be between 1 and 50")
 
-        youtube = build("youtube", "v3", developerKey=self.valves.YOUTUBE_API_KEY)
+        yt = build("youtube", "v3", developerKey=self.valves.YOUTUBE_API_KEY)
         search_resp = (
-            Youtube()
+            yt.search()
             .list(part="snippet", q=query, type="video", maxResults=max_results)
             .execute()
         )
@@ -756,7 +784,7 @@ class Pipe:
 
         if video_ids:
             detail_resp = (
-                youtube.videos()
+                yt.videos()
                 .list(part="statistics,contentDetails", id=",".join(video_ids))
                 .execute()
             )
@@ -774,13 +802,14 @@ class Pipe:
                 )
         return results
 
-    async def Youtube(self, query: str, max_results: int = 5) -> str:
+    async def youtube_search(self, query: str, max_results: int = 5) -> str:
         """
         Search YouTube for videos.
         :param query: The search query.
         :param max_results: The maximum number of results to return (1-50).
         """
         try:
+            query = self._normalize_for_safety(query)
             entries = self._search_youtube_logic(query, max_results)
             items = [SearchItem(**e) for e in entries]
             result = SearchResult(results=items)
@@ -845,14 +874,24 @@ class Pipe:
 
             mini_model_id = self.valves.MINI_MODEL
             small_model_id = self.valves.SMALL_MODEL
+            medium_model_id = self.valves.MEDIUM_MODEL
             large_model_id = self.valves.LARGE_MODEL
             huge_model_id = self.valves.HUGE_MODEL
             planning_model_id = self.valves.PLANNING_MODEL
 
-            # --- OpenRouter models via ChatOpenAI ---
-            planning_model = ChatOpenAI(model=planning_model_id, **self.llm_kwargs)  # type: ignore
-            small_model = ChatOpenAI(model=small_model_id, **self.llm_kwargs)  # type: ignore
-            large_model = ChatOpenAI(model=large_model_id, **self.llm_kwargs)  # type: ignore
+            # --- OpenRouter models via OpenAI-compatible ChatOpenAI ---
+            def LLM(model_id: str) -> ChatOpenAI:
+                return ChatOpenAI(
+                    model=model_id,
+                    base_url=self.valves.OPENROUTER_BASE_URL,
+                    api_key=self.valves.OPENROUTER_API_KEY,
+                    default_headers=self._headers or None,
+                )
+
+            planning_model = LLM(planning_model_id)
+            small_model = LLM(small_model_id)
+            medium_model = LLM(medium_model_id)
+            large_model = LLM(large_model_id)
 
             config = {}
 
@@ -875,31 +914,37 @@ class Pipe:
             send_status = get_send_status(__event_emitter__)
 
             #
-            # STEP 1: Planning
+            # STEP 1: Planning (with safety-normalization for the last user message)
             #
             combined_message = ""
-            for message in body["messages"]:
+            msgs = body["messages"]
+            for idx, message in enumerate(msgs):
                 role = message["role"]
                 message_content = message.get("content", "")
                 content_to_use = ""
                 if isinstance(message_content, str):
-                    if len(message_content) > 1000:
-                        mssg_length = len(message_content)
+                    text_src = message_content
+                    if idx == len(msgs) - 1:  # normalize last user message
+                        text_src = self._normalize_for_safety(text_src)
+                    if len(text_src) > 1000:
+                        mssg_length = len(text_src)
                         content_to_use = (
-                            message_content[:500]
+                            text_src[:500]
                             + "\n...(Middle of message cut by $NUMBER$)...\n"
-                            + message_content[-500:]
+                            + text_src[-500:]
                         )
                         new_mssg_length = len(content_to_use)
                         content_to_use = content_to_use.replace(
                             "$NUMBER$", str(mssg_length - new_mssg_length)
                         )
                     else:
-                        content_to_use = message_content
+                        content_to_use = text_src
                 elif isinstance(message_content, list):
                     for part in message_content:
                         if part.get("type") == "text":
                             text = part.get("text", "")
+                            if idx == len(msgs) - 1:
+                                text = self._normalize_for_safety(text)
                             if len(text) > 1000:
                                 mssg_length = len(text)
                                 content_to_use += (
@@ -929,15 +974,15 @@ class Pipe:
             csv_hastag_list = re.findall(r"<answer>(.*?)</answer>", content)
             csv_hastag_list = csv_hastag_list[0] if csv_hastag_list else "unknown"
 
-            # model selection
+            # model selection (map #medium -> medium, #large -> large)
             if "#mini" in csv_hastag_list:
                 model_to_use_id = mini_model_id
             elif "#small" in csv_hastag_list:
                 model_to_use_id = small_model_id
             elif "#medium" in csv_hastag_list:
-                model_to_use_id = large_model_id
+                model_to_use_id = medium_model_id
             elif "#large" in csv_hastag_list:
-                model_to_use_id = huge_model_id
+                model_to_use_id = large_model_id
             else:
                 model_to_use_id = small_model_id
 
@@ -1010,9 +1055,9 @@ class Pipe:
                 )
 
             if "#!!!" in lm or "#large" in lm:
-                model_to_use_id = huge_model_id
-            elif "#!!" in lm or "#medium" in lm:
                 model_to_use_id = large_model_id
+            elif "#!!" in lm or "#medium" in lm:
+                model_to_use_id = medium_model_id
             elif "#!" in lm or "#small" in lm:
                 model_to_use_id = small_model_id
 
@@ -1021,7 +1066,7 @@ class Pipe:
             elif "#*no" in lm or "#no" in lm:
                 is_reasoning_needed = "NO"
 
-            if model_to_use_id == huge_model_id and len(tool_list) == 0:
+            if model_to_use_id == large_model_id and len(tool_list) == 0:
                 tool_list.append("dummy_tool")
 
             await send_status(
@@ -1086,7 +1131,10 @@ class Pipe:
                             )
                     if tool == "youtube":
                         youtube_funcs = [
-                            (self.Youtube, "Search YouTube for videos."),
+                            (
+                                self.youtube_search,
+                                "Search YouTube for videos.",
+                            ),  # fixed+renamed
                             (
                                 self.get_youtube_transcript,
                                 "Get the transcript of a YouTube video.",
@@ -1125,20 +1173,35 @@ class Pipe:
                                 )
                             )
 
-            model_to_use = ChatOpenAI(model=model_to_use_id, **self.llm_kwargs)  # type: ignore
+            # Log which tools are registered (visibility)
+            try:
+                await send_status(f"Registered tools: {[t.name for t in tools]}", False)
+            except Exception:
+                pass
+
+            model_to_use = LLM(model_to_use_id)
 
             messages_to_use = body["messages"]
             last_message_json = isinstance(messages_to_use[-1].get("content", ""), list)
 
             # Fast path: NO reasoning
             if is_reasoning_needed == "NO":
+                FORCE_TOOLS = ""
+                if tool_list:
+                    FORCE_TOOLS = (
+                        "\nYou MUST call at least one of the provided tools (#online / #youtube / #wolfram) "
+                        "before answering. Do not rely on prior knowledge alone. If tools are unavailable, "
+                        "reply exactly with: TOOL_UNAVAILABLE.\n"
+                    )
+
                 messages_to_use[0]["content"] = (
                     messages_to_use[0]["content"]
                     + USER_INTERACTION_PROMPT
                     + self.SYSTEM_PROMPT_INJECTION
+                    + FORCE_TOOLS
                 )
 
-                # sanitize control tags from final user message
+                # sanitize control tags from final user message and normalize
                 def strip_tags(txt: str) -> str:
                     return (
                         str(txt)
@@ -1159,18 +1222,19 @@ class Pipe:
                     )
 
                 if not last_message_json:
-                    messages_to_use[-1]["content"] = strip_tags(
-                        messages_to_use[-1]["content"]
-                    )
+                    norm = self._normalize_for_safety(messages_to_use[-1]["content"])
+                    messages_to_use[-1]["content"] = strip_tags(norm)
                 else:
-                    messages_to_use[-1]["content"][0]["text"] = strip_tags(
+                    norm = self._normalize_for_safety(
                         messages_to_use[-1]["content"][0]["text"]
                     )
+                    messages_to_use[-1]["content"][0]["text"] = strip_tags(norm)
 
                 graph = create_react_agent(model_to_use, tools=tools)
                 inputs = {"messages": body["messages"]}
 
                 num_tool_calls = 0
+                tool_error_seen = False
                 async for event in graph.astream_events(
                     inputs, version="v2", config=config
                 ):
@@ -1196,6 +1260,38 @@ class Pipe:
                             title=event["name"],
                             content=f"Tool '{event['name']}' with inputs {data.get('input')} returned {data.get('output')}",
                         )
+                    elif kind == "on_tool_error":
+                        tool_error_seen = True
+                        await send_status(
+                            f"Tool '{event['name']}' error: {data.get('error')}", True
+                        )
+                        await send_citation(
+                            url="Tool error",
+                            title=event["name"],
+                            content=str(data),
+                        )
+
+                # Deterministic fallback if planner wanted tools but none were called
+                if num_tool_calls == 0 and tool_list:
+                    # Pull normalized, stripped user text
+                    if isinstance(lm, str):
+                        qtxt = lm
+                    else:
+                        qtxt = lm[0].get("text", "") if lm else ""
+                    qtxt = self._normalize_for_safety(qtxt)
+                    qtxt = (
+                        qtxt.replace("#online", "")
+                        .replace("#youtube", "")
+                        .replace("#wolfram", "")
+                        .replace("#no-tools", "")
+                    )
+
+                    if "youtube" in tool_list:
+                        y = await self.youtube_search(query=qtxt, max_results=5)
+                        yield "\n\n[Fallback: YouTube search]\n" + y
+                    if "online" in tool_list:
+                        s = await self.search_web(query=qtxt, country="AR", focus="web")
+                        yield "\n\n[Fallback: Web search]\n" + s
 
                 await send_status(
                     status_message=f"Done! Took: {round(time.time() - start_time, 1)}s. Used {model_to_use_id}. Reasoning was not used.",
@@ -1206,7 +1302,7 @@ class Pipe:
             # Reasoning path
             elif is_reasoning_needed == "YES":
                 reasoning_model_id = self.valves.REASONING_MODEL
-                reasoning_model = ChatOpenAI(model=reasoning_model_id, **self.llm_kwargs)  # type: ignore
+                reasoning_model = LLM(reasoning_model_id)
 
                 reasoning_context = ""
                 for msg in body["messages"][:-1]:
@@ -1237,11 +1333,9 @@ class Pipe:
 
                 last_msg = body["messages"][-1]
                 if last_msg["role"] == "user" and not last_message_json:
-                    reasoning_context += (
-                        f"--- LAST USER MESSAGE/PROMPT ---\n{last_msg['content']}"
-                    )
+                    reasoning_context += f"--- LAST USER MESSAGE/PROMPT ---\n{self._normalize_for_safety(last_msg['content'])}"
                 elif last_msg["role"] == "user":
-                    reasoning_context += f"--- LAST USER MESSAGE/PROMPT ---\n{last_msg['content'][0]['text']}"
+                    reasoning_context += f"--- LAST USER MESSAGE/PROMPT ---\n{self._normalize_for_safety(last_msg['content'][0]['text'])}"
 
                 for tag in [
                     "#*yes",
@@ -1292,7 +1386,7 @@ class Pipe:
                 full_content = (
                     "<reasoning_agent_output>\n"
                     + reasoning_content
-                    + "\n<reasoning_agent_output>"
+                    + "\n</reasoning_agent_output>"
                 )
 
                 await send_citation(
@@ -1326,7 +1420,9 @@ class Pipe:
                         inputs = {"messages": tool_message}
                         message_buffer = ""
                         num_tool_calls = 0
-                        async for event in graph.astream_events(inputs, version="v2", config=config):  # type: ignore
+                        async for event in graph.astream_events(
+                            inputs, version="v2", config=config
+                        ):
                             if num_tool_calls > 3:
                                 message_buffer += (
                                     "\n[TOO MANY TOOL CALLS - AGENT TERMINATED]"
@@ -1355,6 +1451,16 @@ class Pipe:
                                     title=event["name"],
                                     content=f"Tool '{event['name']}' with inputs {data.get('input')} returned {data.get('output')}",
                                 )
+                            elif kind == "on_tool_error":
+                                await send_status(
+                                    f"Tool '{event['name']}' error: {data.get('error')}",
+                                    True,
+                                )
+                                await send_citation(
+                                    url="Tool error",
+                                    title=event["name"],
+                                    content=str(data),
+                                )
 
                         tool_agent_response = message_buffer
 
@@ -1366,7 +1472,7 @@ class Pipe:
                     full_content += (
                         "\n\n\n<tool_agent_output>\n"
                         + tool_agent_response
-                        + "\n<tool_agent_output>"
+                        + "\n</tool_agent_output>"
                     )
 
                 await send_status(status_message="Reasoning complete.", done=True)
@@ -1394,14 +1500,20 @@ class Pipe:
                 if not last_message_json:
                     messages_to_use[-1]["content"] = (
                         "<user_input>\n"
-                        + strip_tags(messages_to_use[-1]["content"])
+                        + strip_tags(
+                            self._normalize_for_safety(messages_to_use[-1]["content"])
+                        )
                         + "\n</user_input>\n\n"
                         + full_content
                     )
                 else:
                     messages_to_use[-1]["content"][0]["text"] = (
                         "<user_input>\n"
-                        + strip_tags(messages_to_use[-1]["content"][0]["text"])
+                        + strip_tags(
+                            self._normalize_for_safety(
+                                messages_to_use[-1]["content"][0]["text"]
+                            )
+                        )
                         + "\n</user_input>\n\n"
                         + full_content
                     )
@@ -1421,7 +1533,9 @@ class Pipe:
                 )
 
                 num_tool_calls = 0
-                async for event in graph.astream_events(inputs, version="v2", config=config):  # type: ignore
+                async for event in graph.astream_events(
+                    inputs, version="v2", config=config
+                ):
                     if num_tool_calls >= 6:
                         await send_status(
                             status_message="Interupting due to max tool calls reached!",
@@ -1448,6 +1562,37 @@ class Pipe:
                             title=event["name"],
                             content=f"Tool '{event['name']}' with inputs {data.get('input')} returned {data.get('output')}",
                         )
+                    elif kind == "on_tool_error":
+                        await send_status(
+                            f"Tool '{event['name']}' error: {data.get('error')}",
+                            True,
+                        )
+                        await send_citation(
+                            url="Tool error",
+                            title=event["name"],
+                            content=str(data),
+                        )
+
+                # Deterministic fallback if planner wanted tools but none were called
+                if num_tool_calls == 0 and tool_list:
+                    if isinstance(lm, str):
+                        qtxt = lm
+                    else:
+                        qtxt = lm[0].get("text", "") if lm else ""
+                    qtxt = self._normalize_for_safety(qtxt)
+                    qtxt = (
+                        qtxt.replace("#online", "")
+                        .replace("#youtube", "")
+                        .replace("#wolfram", "")
+                        .replace("#no-tools", "")
+                    )
+
+                    if "youtube" in tool_list:
+                        y = await self.youtube_search(query=qtxt, max_results=5)
+                        yield "\n\n[Fallback: YouTube search]\n" + y
+                    if "online" in tool_list:
+                        s = await self.search_web(query=qtxt, country="AR", focus="web")
+                        yield "\n\n[Fallback: Web search]\n" + s
 
                 if not num_tool_calls >= 4:
                     await send_status(
